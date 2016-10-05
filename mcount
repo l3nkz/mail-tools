@@ -212,7 +212,7 @@ class MailAccount(Object):
             self._file_notifier.stop()
 
 
-if __name__ == "__main__":
+def main():
     args = ArgumentParser()
 
     args.add_argument("account", metavar="Account", type=str,
@@ -230,14 +230,22 @@ if __name__ == "__main__":
     if only_get:
         bus = SessionBus()
 
-        try: 
+        try:
             object_path = "/{}".format(account)
-            mcounter = Interface(bus.get_object("org.mcount", object_path),
-                    dbus_interface="org.lockforward")
-        except DBusException:
+            obj = bus.get_object("org.mcount", object_path)
+            mcounter = Interface(obj, dbus_interface="org.mcount")
+        except:
             print("-")
-        else:
+            return
+
+        try:
             print("{}".format(mcounter.count()))
+        except:
+            print("-")
+            return
     else:
         acc = MailAccount(account)
         acc.run()
+
+if __name__ == "__main__":
+    main()
