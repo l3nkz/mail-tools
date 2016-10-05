@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+
+from datetime import datetime, timedelta, date, time
+from argparse import ArgumentParser
+
+from mailbox import Maildir, NoSuchMailboxError
+
+from email.utils import parsedate_tz, mktime_tz
+
+import sys
+
+from os import environ, makedirs
+from os.path import join, expanduser
+
+import logging
+from logging import StreamHandler, Formatter
+
+
+# Logging
+logger = logging.getLogger("mailmanage")
+handler = StreamHandler()
+logger.addHandler(handler)
+
+
+# Printing
+quiet = False
+
+def output(*objects, sep='', end='\n', file=sys.stdout, flush=False):
+    if not quiet:
+        print(*objects, sep=sep, end=end, file=file, flush=flush)
+
+
+class ProgressBar:
+
+    LEFT = "["
+    RIGHT = "]"
+    DONE = "*"
+    TODO = "."
+
+    def __init__(self, end=100, start=0, size=10):
+        self._current = start
+        self._end = end if end >= 1 else 1
+        self._size = size
+
+    def __repr__(self):
+        return "<ProgressBar>({})".format(self.display())
+
+    def __str__(self):
+        return self.display()
+
+    def display(self):
+        progress = int(float(self._current)/float(self._end)*self._size)
+        todo = self._size - progress
+
+        return ProgressBar.LEFT + ProgressBar.DONE*progress \
+                + ProgressBar.TODO*todo + ProgressBar.RIGHT
+
+    def set(self, value):
+        self._current = value
+
+        if self._current > self._end:
+            self._current = self._end
+        elif self._current < 0:
+            self._current = 0
+
+    def update(self, count=1):
+        self._current += count
+
+        if self._current > self._end:
+            self._current = self._end
+        elif self._current < 0:
+            self._current = 0
+
+
+class HourClass:
+
+    STATES = ['|', '/', '-', '\\']
+
+    def __init__(self):
+        self._current = 0
+
+    def __repr__(self):
+        return "<HourClass>({})".format(self.display())
+
+    def __str__(self):
+        return self.display()
+
+    def display(self):
+        return HourClass.STATES[self._current]
+
+    def update(self):
+        self._current = (self._current + 1) % len(HourClass.STATES)
+
+
+class CounterField:
+
+    def __init__(self, start=0):
+        self._current = start
+
+    def __repr__(self):
+        return "<CounterField>({})".format(self.display())
+
+    def __str__(self):
+        return self.display()
+
+    def display(self):
+        return str(self._current)
+
+    def set(self, value):
+        self._current = value
+
+        if self._current < 0:
+            self._current = 0
+
+    def update(self, count=1):
+        self._current += count
+
+        if self._current < 0:
+            self._current = 0
+
+
+class CounterOfField:
+
+    SEPARATOR = '/'
+    SPACE = ' '
+
+    def __init__(self, end, start=0):
+        self._current = start
+        self._end = end
+        self._size = len(str(end))
+
+    def __repr__(self):
+        return "<CounterOfField>({})".format(self.display())
+
+    def __str__(self):
+        return self.display()
+
+    def display(self):
+        numbers = len(str(self._current))
+        spaces = self._size - numbers
+
+        return CounterOfField.SPACE*spaces + str(self._current) \
+                + CounterOfField.SEPARATOR + str(self._end)
+
+    def set(self, value):
+        self._current = value
+
+        if self._current > self._end:
+            self._current = self._end
+        elif self._current < 0:
+            self._current = 0
+
+    def update(self, count=1):
+        self._current += count
+
+        if self._current > self._end:
+            self._current = self._end
+        elif self._current < 0:
+            self._current = 0
+
+
+class CounterProgressBar:
+
+    SEPARATOR = ' '
+
+    def __init__(self, end, start=0, bar_size=10, bar_pos='l'):
+        self._counter = CounterOfField(end, start)
+        self._bar = ProgressBar(end, start, bar_size)
+
+        if bar_pos == 'l':
+            self._bar_pos = 'l'
+        elif bar_pos == 'r':
+            self._bar_pos = 'r'
+        else:
+            self._bar_pos = 'l'
+
+    def __repr__(self):
+        return "<CounterProgressBar>({})".format(self.display())
+
+    def __str__(self):
+        return self.display()
+
+    def display(self):
+        if self._bar_pos == 'l':
+            return self._bar.display() + CounterProgressBar.SEPARATOR + self._counter.display()
+        else:
+            return self._counter.display() + CounterProgressBar.SEPARATOR + self._bar.display()
+
+    def set(self, value):
+        self._bar.set(value)
+        self._counter.set(value)
+
+    def update(self, count=1):
+        self._bar.update(count)
+        self._counter.update(count)
+
+
+class CounterHourClass:
+
+    SEPARATOR = ' '
+
+    def __init__(self, start=0, hc_pos='r'):
+        self._counter = CounterField(start)
+        self._hc = HourClass()
+
+        if hc_pos == 'r':
+            self._hc_pos = 'r'
+        elif hc_pos == 'l':
+            self._hc_pos = 'l'
+        else:
+            self._hc_pos = 'r'
+
+    def __repr__(self):
+        return "<CounterHourClass>({})".format(self.display())
+
+    def __str__(self):
+        return self.display()
+
+    def display(self):
+        if self._hc_pos == 'l':
+            return self._hc.display() + CounterHourClass.SEPARATOR + self._counter.display()
+        else:
+            return self._counter.display() + CounterHourClass.SEPARATOR + self._hc.display()
+
+    def set(self, value):
+        self._counter.set(value)
+
+    def update(self, count=1):
+        self._counter.update(count)
+        self._hc.update()
+
+
+class TextField:
+
+    def __init__(self, text=""):
+        self._text = text
+
+    def __repr__(self):
+        return "<TextField>({})".format(self.display())
+
+    def __str__(self):
+        return self.display()
+
+    def display(self):
+        return self._text
+
+    def set(self, new_text):
+        self._text = new_text.strip()
+
+
+class PrettyPrinter:
+
+    def __init__(self, sep=' ', end='\r', done='\n', flush=True):
+        self._sep = sep
+        self._end = end
+        self._done = done
+        self._flush = flush
+
+        self._order = []
+        self._elements = {}
+
+    def __contains__(self, name):
+        if not isinstance(name, str):
+            raise TypeError("The index must be of type str")
+
+        return name in self._elements
+
+    def __delitem__(self, name):
+        if not isinstance(name, str):
+            raise TypeError("The index must be of type str")
+
+        if not name in self._elements:
+            raise KeyError("The element {} does not exist.".format(name))
+
+        self._order.remove(name)
+        del self._elements[name]
+
+    def __getitem__(self, name):
+        if not isinstance(name, str):
+            raise TypeError("The index must be of type str")
+
+        if not name in self._elements:
+            raise KeyError("The element {} does not exist.".format(name))
+
+        return self._elements[name]
+
+    def _text(self):
+        element_texts = []
+
+        for element in self._order:
+            element_texts.append(self._elements[element].display())
+
+        return self._sep.join(element_texts)
+
+    def append(self, name, element):
+        if name in self._elements:
+            raise ValueError("An element with the name {} already exists.".format(name))
+
+        self._order.append(name)
+        self._elements[name] = element
+
+        return self
+
+    def insert(self, position, name, element):
+        if name in self._elements:
+            raise ValueError("An element with the name {} already exists".format(name))
+
+        self._order.insert(position, name)
+        self._elements[name] = element
+
+        return self
+
+    def remove(self, name):
+        if not name in self._elements:
+            raise ValueError("An element with the name {} does not yet exist.".format(name))
+
+        self._order.remove(name)
+        del self._elements[name]
+
+        return self
+
+    def display(self):
+        output(self._text(), end=self._end, flush=self._flush)
+
+    def done(self):
+        output(self._text(), end=self._done, flush=True)
+
+
+class MailThreadTree:
+
+    class Node:
+
+        def __init__(self):
+            self._valid = False
+
+            self.key = None
+            self.mail_id = None
+            self.subject = None
+            self.replies_to = None
+            self.references_to = []
+
+            self.replied_by = set()
+            self.referenced_by = set()
+
+        def init(self, key, mail):
+            self._valid = True
+
+            self.key = key
+            self.mail_id = mail["Message-ID"]
+            self.subject = mail["Subject"]
+            self.replies_to = mail["In-Reply-To"]
+            self.references_to = [] if mail["References"] is None else mail["References"]
+
+        def add_reply(self, other):
+            self.replied_by.add(other.mail_id)
+
+        def add_reference(self, other):
+            self.referenced_by.add(other.mail_id)
+
+        def is_valid(self):
+            return self._valid
+
+        def is_replying(self):
+            return self.replies_to is not None
+
+        def is_referencing(self):
+            return len(self.references_to) > 0
+
+
+    def __init__(self, mails, maildir):
+        logger.info("Building mail thread tree.")
+
+        pprinter = PrettyPrinter().append(
+                "text", TextField("Creating MailThreadTree")
+            ).append(
+                "cbar", CounterProgressBar(len(mails))
+            )
+
+        self._items = {}
+
+        for key in mails:
+            pprinter["cbar"].update()
+            pprinter.display()
+
+            try:
+                mail = maildir[key]
+                self._add(key, mail)
+            except KeyError:
+                logger.warn("Could not find mail for key {}".format(key))
+
+        pprinter.done()
+
+    def _get_safe(self, mail_id):
+        if mail_id not in self._items:
+            self._items[mail_id] = MailThreadTree.Node()
+
+        return self._items[mail_id]
+
+    def _add(self, key, mail):
+        mail_id = mail["Message-ID"]
+
+        current = self._get_safe(mail_id)
+        current.init(key, mail)
+
+        if current.is_replying():
+            other = self._get_safe(current.replies_to)
+            other.add_reply(current)
+
+        if current.is_referencing():
+            for other_id in current.references_to:
+                other = self._get_safe(other_id)
+                other.add_reference(current)
+
+    def _root_of(self, mail_id):
+        if mail_id not in self._items:
+            raise KeyError("No mail with ID {} exists in the tree.".format(
+                mail_id))
+
+        current = self._items[mail_id]
+
+        if not current.is_valid():
+            raise KeyError("The mail with ID {} is not valid.".format(
+                mail_id))
+
+        if not current.is_replying() and not current.is_referencing():
+            # It seems as if we found the root of the thread.
+            logger.debug("Found root. Subject is {}, ID is {}.".format(
+                current.subject, current.mail_id))
+
+            return current
+        else:
+            # First try all referenced mails.
+            for reference in current.references_to:
+                try:
+                    return self._root_of(reference)
+                except KeyError as e:
+                    logger.debug("Expecting {} to be root, but reported {}.".format(
+                        reference, str(e)))
+
+            # We tested all referenced mails and it seems as if all of them
+            # do not exist. So try the one which this mail replied to.
+            try:
+                return self._root_of(current.replies_to)
+            except KeyError as e:
+                logger.debug("Expecting {} to be root, but reported {}.".format(
+                    current.replies_to, str(e)))
+
+        # None of the mail IDs which where mentioned in the mail do exist.
+        # Hence we can not get any better in the thread as the current mail.
+        logger.debug("Could not find root. Best what we got is {}, {}.".format(
+            current.subject, current.mail_id))
+
+        return current
+
+    def _leafs_of(self, mail_id):
+        if mail_id not in self._items:
+            raise KeyError("No mail with ID {} exists in the tree.".format(
+                mail_id))
+
+        current = self._items[mail_id]
+
+        if not current.is_valid():
+            raise KeyError("The mail with ID {} is not valid.".format(
+                mail_id))
+
+        result = set([current])
+
+        for other_id in current.referenced_by:
+            try:
+                result = result.union(self._leafs_of(other_id))
+            except KeyError:
+                logger.debug("Could not reach leaf of thread. {} is missing.".format(
+                    other_id))
+
+        for other_id in current.replied_by:
+            try:
+                result = result.union(self._leafs_of(other_id))
+            except KeyError:
+                logger.debug("Could not reach leaf of thread. {} is missing.".format(
+                    other_id))
+
+        return result
+
+    def thread_of(self, mail):
+        mail_id = mail["Message-ID"]
+
+        if mail_id not in self._items:
+            raise KeyError("No mail with the ID {} exists in the mail tree.".format(
+                mail_id))
+
+        current = self._items[mail_id]
+
+        if not current.is_valid():
+            raise KeyError("The mail with the ID {} is not valid in the mail tree.".format(
+                mail_id))
+
+        logger.info("Try to find root for thread {}.".format(
+            current.subject))
+
+        root = self._root_of(current.mail_id)
+
+        logger.info("Best root we could find is {} with {}".format(
+            root.mail_id, root.subject))
+
+        result = []
+        for leaf in self._leafs_of(root.mail_id):
+            result.append(leaf.key)
+
+        logger.info("Found {} mails belonging to the thread.".format(
+            len(result)))
+
+        return result
+
+
+class MailManager:
+
+    def add_arguments(parser):
+        parser.add_argument("account", action="store", help="The account to which the mailbox belongs.",
+                type=str)
+        parser.add_argument("mailbox", action="store", help="The mailbox which should be managed.",
+                type=str)
+
+        parser.add_argument("-k", "--keep", action="store", help="The number of days which should be kept.",
+                type=int, default=30, dest="days", required=False)
+        parser.add_argument("-t", "--no-threads", action="store_true", help="Do not try to keep threads together.",
+                default=False, dest="no_threads", required=False)
+
+        output_group = parser.add_mutually_exclusive_group()
+        output_group.add_argument("-v", action="count", help="Turn on more verbosity.",
+                default=0, dest="verbose", required=False)
+        output_group.add_argument("--quiet", action="store_true", help="Turn off all output.",
+                default=False, dest="quiet", required=False)
+
+
+    def __init__(self, arguments):
+        self._account = arguments.account
+        self._box = arguments.mailbox
+        self._days = arguments.days
+        self._threads = not arguments.no_threads
+
+        global quiet
+        quiet = arguments.quiet
+        verbose = arguments.verbose
+
+        if verbose >= 2:
+            logger.setLevel(logging.DEBUG)
+            formatter = Formatter(
+                    fmt="%(asctime)s - %(name)s:%(lineno)d -- %(levelname)s:" +
+                    " %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
+        elif verbose >= 1:
+            logger.setLevel(logging.INFO)
+            formatter = Formatter(
+                    fmt="%(asctime)s -- %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
+        else:
+            logger.setLevel(logging.WARNING)
+            formatter = Formatter(
+                    fmt="%(asctime)s -- %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
+
+        handler.setFormatter(formatter)
+
+        try:
+            self._base_path = environ["MAIL"]
+        except KeyError:
+            self._base_path = "~/.mail"
+
+        self._box_path = expanduser(join(self._base_path, self._account, self._box))
+
+        try:
+            self._maildir = Maildir(self._box_path, create=False)
+        except NoSuchMailboxError as e:
+            raise ValueError("{} is not a mailbox".format(self._box_path))
+
+        output("Managing mailbox {} ({})".format(self._box, self._account))
+
+
+    def _rebuild_threads(self, remove, keep):
+        logger.info("Rebuilding mail threads.")
+
+        mails = MailThreadTree(remove+keep, self._maildir)
+
+        final_keep = set()
+        final_remove = set()
+
+        # For each mail we want to keep, determine the corresponding mail
+        # thread and keep it as well.
+        logger.info("Collect all mails which should be kept.")
+
+        pprinter = PrettyPrinter().append(
+                "text", TextField("Collecting mails to keep")
+            ).append(
+                "cbar", CounterProgressBar(len(keep))
+            )
+
+        for key in keep:
+            pprinter["cbar"].update()
+            pprinter.display()
+
+            if key in final_keep:
+                # We already added this mail to the list of mails to keep.
+                continue
+
+            # Rebuild the complete thread corresponding to the current mail
+            # and add it to the list of mails to keep.
+            mail = self._maildir[key]
+            for tkey in mails.thread_of(mail):
+                if tkey in final_keep:
+                    continue
+
+                logger.debug("Keep mail {}.".format(tkey))
+                final_keep.add(tkey)
+
+        pprinter.done()
+
+        # Finally calculate the corresponding list of mails which should not
+        # be kept.
+        logger.info("Collect all mails which should not be kept.")
+
+        pprinter = PrettyPrinter().append(
+                "text", TextField("Collecting mails to remove")
+            ).append(
+                "cbar", CounterProgressBar(len(remove))
+            )
+
+        for key in remove:
+            pprinter["cbar"].update()
+            pprinter.display()
+
+            if key in final_keep or key in final_remove:
+                # This mail should either be kept or is already marked as
+                # removable.
+                continue
+
+            logger.debug("Remove mail {}.".format(key))
+            final_remove.add(key)
+
+        pprinter.done()
+
+        logger.info("Found {} more mails to keep ({} vs {}).".format(
+            len(final_keep)-len(keep), len(final_keep), len(keep)))
+
+        return (final_remove, final_keep)
+
+    def _collect_mails(self, separation_date):
+        logger.info("Separating mails according to {}".format(separation_date))
+
+        pprinter = PrettyPrinter().append(
+                "text", TextField("Separating mails")
+            ).append(
+                "hc", CounterHourClass()
+            )
+
+        before_date = []
+        after_date = []
+
+        for (key, mail) in self._maildir.iteritems():
+            pprinter["hc"].update()
+            pprinter.display()
+
+            date = mktime_tz(parsedate_tz(mail["Date"]))
+
+            if datetime.fromtimestamp(date) < separation_date:
+                before_date.append(key)
+            else:
+                after_date.append(key)
+
+        pprinter.done()
+
+        if self._threads:
+            logger.debug("Rebuilding mail threads.")
+            return self._rebuild_threads(before_date, after_date)
+        else:
+            logger.debug("Not rebuilding mail threads.")
+            return (before_date, after_date)
+
+
+class MailArchiver(MailManager):
+
+    def add_arguments(parser):
+        MailManager.add_arguments(parser)
+
+        parser.set_defaults(operation=MailArchiver.create_and_run)
+
+    def create_and_run(arguments):
+        MailArchiver(arguments).run()
+
+    def __init__(self, arguments):
+        MailManager.__init__(self, arguments)
+
+        self._archive_path = join(self._base_path, self._account,
+                "Archive", self._box)
+        self._create_archive(self._archive_path)
+
+        self._archive_maildir = Maildir(self._archive_path,
+                create=True)
+
+    def _create_archive(self, archive_path):
+        # Create the base path
+        makedirs(archive_path, exist_ok=True)
+
+        # Create the maildir specific folders
+        makedirs(join(archive_path, "new"), exist_ok=True)
+        makedirs(join(archive_path, "tmp"), exist_ok=True)
+        makedirs(join(archive_path, "cur"), exist_ok=True)
+
+    def run(self):
+        sep_date = datetime.combine(date.today(), time.min) - timedelta(days=self._days)
+        (remove, keep) = self._collect_mails(sep_date)
+
+        if len(remove) > 0:
+            output("Moving {} mails from {} ({}) to archive {}".format(
+                len(remove), self._box, self._account, self._archive_path))
+
+            pprinter = PrettyPrinter().append(
+                    "text", TextField("Moving mail to archive")
+                ).append(
+                    "cbar", CounterProgressBar(len(remove))
+                )
+
+            for key in remove:
+                pprinter["cbar"].update()
+                pprinter.display()
+
+                mail = self._maildir[key]
+                self._archive_maildir.add(mail)
+                self._maildir.remove(key)
+
+            pprinter.done()
+        else:
+            print("Nothing to do for {} ({})".format(
+                self._box, self._account))
+
+
+class MailDeleter(MailManager):
+
+    def add_arguments(parser):
+        MailManager.add_arguments(parser)
+
+        parser.set_defaults(operation=MailDeleter.create_and_run)
+
+    def create_and_run(arguments):
+        MailDeleter(arguments).run()
+
+    def __init__(self, arguments):
+        MailManager.__init__(self, arguments)
+
+    def run(self):
+        sep_date = datetime.combine(date.today(), time.min) - timedelta(days=self._days)
+        (remove, keep) = self._collect_mails(sep_date)
+
+        if len(remove) > 0:
+            output("Deleting {} mails from {} ({})".format(
+                len(remove), self._box, self._account))
+
+            pprinter = PrettyPrinter().append(
+                    "text", TextField("Deleting mail")
+                ).append(
+                    "cbar", CounterProgressBar(len(remove))
+                )
+
+            for key in remove:
+                pprinter["cbar"].update()
+                pprinter.display()
+
+                self._maildir.remove(key)
+
+            pprinter.done()
+        else:
+            print("Nothing to do for {} ({})".format(
+                self._box, self._account))
+
+
+class MailDryrun(MailManager):
+
+    def add_arguments(parser):
+        MailManager.add_arguments(parser)
+
+        parser.set_defaults(operation=MailDryrun.create_and_run)
+
+    def create_and_run(arguments):
+        MailDryrun(arguments).run()
+
+    def __init__(self, arguments):
+        MailManager.__init__(self, arguments)
+
+    def run(self):
+        sep_date = datetime.combine(date.today(), time.min) - timedelta(days=self._days)
+        (remove, keep) = self._collect_mails(sep_date)
+
+        output("Maildir {} ({}) contains {} mails.".format(
+            self._box, self._account, len(remove)+len(keep)))
+
+        output("{} mails of them are older then {} days.".format(
+            len(remove), self._days))
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser(description="Manage local Maildirs.")
+
+    operations = parser.add_subparsers(title="Operations", dest="operations")
+    operations.required = True
+
+    MailArchiver.add_arguments(operations.add_parser("archive"))
+    MailDeleter.add_arguments(operations.add_parser("delete"))
+    MailDryrun.add_arguments(operations.add_parser("dryrun"))
+
+    arguments = parser.parse_args()
+    operation = arguments.operation
+
+    operation(arguments)

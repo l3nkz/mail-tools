@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+
+import pyinotify
+from pyinotify import WatchManager, ThreadedNotifier
+
+import gi.repository.GLib as glib
+
+from dbus import Interface, SessionBus
+from dbus.service import method, Object, BusName
+from dbus.mainloop.glib import DBusGMainLoop
+
+from os import listdir, environ, walk
+from os.path import isfile, join, expanduser, relpath, split
+
+from argparse import ArgumentParser
+
+
+class Mailbox:
+
+    def __init__(self, name, path, event_handler):
+        self._name = name
+        self._path = path
+        self._event_handler = event_handler
+
+        self._count = 0
+
+        self._initial_count()
+        self._add_watches()
+
+    def __str__(self):
+        return "Mailbox ({:s}, {:d})".format(self._name, self._count)
+
+    def _add_watches(self):
+        self._event_handler.add_watch(self._path, {pyinotify.IN_CREATE : self.unread_mail,
+                                                   pyinotify.IN_MOVED_TO : self.unread_mail,
+                                                   pyinotify.IN_DELETE : self.read_mail,
+                                                   pyinotify.IN_MOVED_FROM : self.read_mail})
+
+    def _initial_count(self):
+        for e in listdir(self._path):
+            if isfile(join(self._path, e)):
+                self._count += 1
+
+    def unread_mail(self, event):
+        self._count += 1
+        print("Unread mail in {:s} ({:d}).".format(self._name, self._count))
+
+    def read_mail(self, event):
+        self._count -= 1
+        print("Read mail in {:s} ({:d}).".format(self._name, self._count))
+
+    @property
+    def count(self):
+        return self._count
+
+
+def mask_for_cbs(cbs):
+    mask = 0
+    for (t, cb) in cbs.items():
+        mask = mask | t
+
+    return mask
+
+class MailAccount(Object):
+
+    class EventHandler(pyinotify.ProcessEvent):
+
+        def __init__(self, watch_manager):
+            self._watch_manager = watch_manager
+
+            self._watches = {}
+
+        def _process(self, event, event_type):
+            path = event.pathname
+
+            while True:
+                if path in self._watches:
+                    _, cbs = self._watches[path]
+                    if event_type in cbs:
+                        cbs[event_type](event)
+                        return True
+
+                base_path, _ = split(path)
+                if base_path == path:
+                    print("Failed to handle {} for {}".format(
+                        pyinotify.EventsCodes.maskname(event_type), event.pathname))
+                    return False
+                else:
+                    path = base_path
+
+        def add_watch(self, path, callbacks):
+            if path in self._watches:
+                wd, old_cbs = self._watches[path]
+
+                old_mask = mask_for_cbs(old_cbs)
+                new_mask = mask_for_cbs(callbacks)
+
+                if old_mask == new_mask:
+                    return
+                else:
+                    watches = self._watch_manager.update_watch(wd, mask=new_mask)
+                    for (p, wd) in watches.items():
+                        if p == path:
+                            if wd < 0:
+                                raise RuntimeError("Failed to update watch for {}".format(path))
+                            else:
+                                self._watches[path] = (wd, callbacks)
+            else:
+                mask = mask_for_cbs(callbacks)
+                watches = self._watch_manager.add_watch(path, mask=mask)
+                for (p, wd) in watches.items():
+                    if p == path:
+                        if wd < 0:
+                            raise RuntimeError("Failed to add watch for {}".format(path))
+                        else:
+                            self._watches[path] = (wd, callbacks)
+
+        def process_IN_ACCESS(self, event):
+            self._process(event, pyinotify.IN_ACCESS)
+
+        def process_IN_ATTRIB(self, event):
+            self._process(event, pyinotify.IN_ATTRIB)
+
+        def process_IN_CLOSE_NOWRITE(self, event):
+            self._process(event, pyinotify.IN_CLOSE_NOWRITE)
+
+        def process_IN_CLOSE_WRITE(self, event):
+            self._process(event, pyinotify.IN_CLOSE_WRITE)
+
+        def process_IN_CREATE(self, event):
+            self._process(event, pyinotify.IN_CREATE)
+
+        def process_IN_DELETE(self, event):
+            self._process(event, pyinotify.IN_DELETE)
+
+        def process_IN_DELETE_SELF(self, event):
+            self._process(event, pyinotify.IN_DELETE_SELF)
+
+        def process_IN_MODIFY(self, event):
+            self._process(event, pyinotify.IN_MODIFY)
+
+        def process_IN_MOVED_FROM(self, event):
+            self._process(event, pyinotify.IN_MOVED_FROM)
+
+        def process_IN_MOVED_TO(self, event):
+            self._process(event, pyinotify.IN_MOVED_TO)
+
+        def process_IN_MOVE_SELF(self, event):
+            self._process(event, pyinotify.IN_MOVE_SELF)
+
+        def process_IN_OPEN(self, event):
+            self._process(event, pyinotify.IN_OPEN)
+
+    def __init__(self, name):
+        self._name = name
+        try:
+            self._maildir = environ["MAIL"]
+        except KeyError:
+            self._maildir = expanduser("~/.mail")
+
+        self._base_path = join(self._maildir, self._name)
+
+        self._init_mailboxes()
+        self._init_dbus()
+
+    def _init_dbus(self):
+        bus = SessionBus(mainloop=DBusGMainLoop(set_as_default=True))
+        bus_name = BusName("org.mcount", bus=bus)
+        object_path = "/{}".format(self._name)
+
+        self._main_loop = glib.MainLoop()
+
+        Object.__init__(self, bus_name=bus_name, object_path=object_path)
+
+    def _init_mailboxes(self):
+        self._watch_manager = WatchManager()
+        self._handler = MailAccount.EventHandler(self._watch_manager)
+        self._file_notifier = ThreadedNotifier(self._watch_manager, self._handler)
+
+        self._mailboxes = []
+
+        for current, directories, files in walk(self._base_path):
+            # If there is a 'new' directory in the current one, then this is a
+            # mailbox. So add it to our list of mailboxes.
+            if "new" in directories:
+                mb = Mailbox(
+                        relpath(current, self._maildir),
+                        join(current, "new"),
+                        self._handler
+                )
+
+                if not mb in self._mailboxes:
+                    self._mailboxes.append(mb)
+
+                    print("Watching {}".format(mb))
+
+    @method(dbus_interface="org.mcount", out_signature="i")
+    def count(self):
+        s = 0
+        for box in self._mailboxes:
+            s += box.count
+
+        return s
+
+    def run(self):
+        self._file_notifier.start()
+
+        try:
+            self._main_loop.run()
+        except KeyboardInterrupt:
+            self._main_loop.quit()
+            self._file_notifier.stop()
+
+
+if __name__ == "__main__":
+    args = ArgumentParser()
+
+    args.add_argument("account", metavar="Account", type=str,
+            help="name of the mail account")
+
+    args.add_argument("-g", "--get", action="store_true", required=False, default=False,
+            help="only get the latest value from the counting process",
+            dest="only_get")
+
+    parsed_args=args.parse_args()
+
+    account = parsed_args.account
+    only_get = parsed_args.only_get
+
+    if only_get:
+        bus = SessionBus()
+
+        try: 
+            object_path = "/{}".format(account)
+            mcounter = Interface(bus.get_object("org.mcount", object_path),
+                    dbus_interface="org.lockforward")
+        except DBusException:
+            print("-")
+        else:
+            print("{}".format(mcounter.count()))
+    else:
+        acc = MailAccount(account)
+        acc.run()

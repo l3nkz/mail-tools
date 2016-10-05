@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+
+from pynoter import Client
+
+from os import environ, walk
+from os.path import expanduser, relpath, join
+
+import pyinotify
+from pyinotify import WatchManager, Notifier
+
+from mailbox import MaildirMessage
+
+from email.header import decode_header as dec_header
+
+from xml.sax.saxutils import escape as escape_header
+
+
+def decode_header(mail, header):
+    parts = []
+
+    # Decode the different parts of the header.
+    for s, e in dec_header(mail[header]):
+        if isinstance(s, str):
+            parts.append(s)
+        elif isinstance(s, bytes):
+            parts.append(str(s, 'ascii' if e is None else e))
+
+    result = ' '.join(parts)
+
+    # Remove line breaks from the result.
+    return result.replace('\n', '').replace('\r', '')
+
+
+class Mailbox:
+
+    def __init__(self, name, path, pynoter_client, watch_manager):
+        self._name = name
+        self._path = path
+
+        # The pynoter client which should be used.
+        self._pynoter_client = pynoter_client
+        self._last_message = ""
+
+        # File watching stuff.
+        self._watch_manager = watch_manager
+
+        # Add watch for this mailbox.
+        self._add_watch(self._watch_manager)
+
+    def __str__(self):
+        return "Mailbox {} ({})".format(self._name, self._path)
+
+    def _add_watch(self, watch_manager):
+        watches = watch_manager.add_watch(self._path,
+                pyinotify.IN_CREATE | pyinotify.IN_MOVED_TO,
+                proc_fun=self.new_mail)
+
+        for (p, wd) in watches.items():
+            if p == self._path:
+                if wd < 0:
+                    print("Failed to add watch for {}".format(self))
+
+    def new_mail(self, event):
+        mail_path = event.pathname
+
+        # Extract the subject and from header from the mail.
+        try:
+            with open(mail_path, 'r') as mail_file:
+                mail = MaildirMessage(message=mail_file)
+
+            from_header = decode_header(mail, 'From')
+            subject_header = decode_header(mail, 'Subject')
+
+            # Escape the mail headers so that they will always display properly.
+            from_header = escape_header(from_header)
+            subject_header = escape_header(subject_header)
+
+            print("New mail in {} -- {}: {}".format(self._name, from_header,
+                subject_header))
+
+            # Display the message
+            self._last_message = self._pynoter_client.display_message(
+                    "New mails in {}".format(self._name),
+                    "{}: {}".format(from_header, subject_header),
+                    icon="notification-message-email",
+                    append=True,
+                    reference=self._last_message
+            )
+
+        except Exception as e:
+            print("An error happened while displaying mail in {}: {}".format(
+                self._name, e))
+
+
+class MailNotify:
+
+    def __init__(self):
+        # Initialize the pynoter client.
+        self._pynoter_client = Client("mailnotify")
+
+        # Initialize the file watching.
+        self._watch_manager = WatchManager()
+        self._file_notifier = Notifier(self._watch_manager)
+
+        # Get the mail directory
+        try:
+            self._maildir = environ["MAIL"]
+        except KeyError:
+            self._maildir = expanduser("~/.mail")
+
+        # Internal variables
+        self._mailboxes = []
+
+    def _find_mailboxes(self):
+        for current, directories, files in walk(self._maildir):
+            # If there is a 'new' directory in the current one, then this is a
+            # mailbox. So add it to our list of mailboxes.
+            if "new" in directories:
+                mb = Mailbox(
+                        relpath(current, self._maildir),
+                        join(current, "new"),
+                        self._pynoter_client,
+                        self._watch_manager
+                )
+
+                if not mb in self._mailboxes:
+                    self._mailboxes.append(mb)
+
+                    print("Watching {}".format(mb))
+
+    def run(self):
+        self._find_mailboxes()
+
+        self._file_notifier.loop()
+
+
+if __name__ == "__main__":
+    prog = MailNotify()
+
+    prog.run()
