@@ -5,9 +5,11 @@ from pyinotify import WatchManager, ThreadedNotifier
 
 import gi.repository.GLib as glib
 
-from dbus import Interface, SessionBus
+from dbus import Interface, SessionBus, NameExistsException, DBusException
 from dbus.service import method, Object, BusName
 from dbus.mainloop.glib import DBusGMainLoop
+
+from sys import exit
 
 from os import listdir, environ, walk
 from os.path import isfile, join, expanduser, relpath, split
@@ -167,12 +169,15 @@ class MailAccount(Object):
 
     def _init_dbus(self):
         bus = SessionBus(mainloop=DBusGMainLoop(set_as_default=True))
-        bus_name = BusName("org.mcount", bus=bus)
-        object_path = "/{}".format(self._name)
+        name = "org.mcount." + self._name
+        try:
+            bus_name = BusName(name, bus=bus, do_not_queue=True)
+        except NameExistsException:
+            print("A different mcount instance is already running for this account!")
+            exit(1)
 
         self._main_loop = glib.MainLoop()
-
-        Object.__init__(self, bus_name=bus_name, object_path=object_path)
+        Object.__init__(self, bus_name, "/")
 
     def _init_mailboxes(self):
         self._watch_manager = WatchManager()
@@ -233,18 +238,14 @@ def main():
         bus = SessionBus()
 
         try:
-            object_path = "/{}".format(account)
-            obj = bus.get_object("org.mcount", object_path)
+            bus_name = "org.mcount." + account
+            obj = bus.get_object(bus_name, "/")
             mcounter = Interface(obj, dbus_interface="org.mcount")
-        except:
+        except DBusException:
             print("-")
             return
 
-        try:
-            print("{}".format(mcounter.count()))
-        except:
-            print("-")
-            return
+        print("{}".format(mcounter.count()))
     else:
         acc = MailAccount(account)
         acc.run()
