@@ -160,6 +160,8 @@ class MailAccount(Object):
 
         self._base_path = join(self._maildir, self._name)
 
+        print("Watching mails account {} ({})".format(self._name, self._base_path))
+
         self._init_mailboxes()
         self._init_dbus()
 
