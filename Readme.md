@@ -9,7 +9,7 @@ requested from the script via a D-Bus interface.
 
 ## mmanage
 
-This script can be used to clean up folders with a lot of files. The aim of the script is to
+This script can be used to clean up folders with a lot of mails. The aim of the script is to
 remove mails from a maildir which are older than a particular number of days. These mails can
 be either directly removed or archived into a different folder. The script also supports a
 dry-run operation. An additional feature of the script is, that it tries to keep threads together.
